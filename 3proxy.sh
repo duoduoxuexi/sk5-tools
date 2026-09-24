@@ -25,7 +25,7 @@ PROXY_PORT="${PROXY_PORT:-25000}"
 read -rp "用户名 [admin]: " PROXY_USER
 PROXY_USER="${PROXY_USER:-admin}"
 
-read -rsp "密码（建议 12 位以上，避免冒号和空格）: " PROXY_PASS
+read -rp "密码（建议 12 位以上，避免冒号和空格）: " PROXY_PASS
 echo
 if [[ -z "$PROXY_PASS" ]]; then
   echo "密码不能为空。"
