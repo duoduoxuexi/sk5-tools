@@ -9,6 +9,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 unset PROXY_PASS PROXY_USER
 
 readonly SOURCE_VERSION=0.9.9.0
+readonly INSTALLER_REVISION=2026-09-30.3
 readonly SOURCE_SHA256=5af253fa734f61af6d5fe3790022130a14caf25bfce24a6aefd415797d351dd3
 readonly CONFIG=/etc/3proxy/3proxy.cfg
 readonly UNIT=/etc/systemd/system/3proxy.service
@@ -119,15 +120,22 @@ apt_install_safe() {
     # Freeze every already-installed libc6 / OpenSSL runtime (including multiarch).
     # New libc6/libssl runtime installations are also rejected in the dry run.
     while IFS=$'\t' read -r package version status; do
-        if [[ "$status" == installed && "$package" =~ ^(libc6(:|$|-)|libssl[0-9]) ]]; then
+        # Match actual runtime packages, NOT libc6-dev/libc6-dev-bin/libc6-dbg.
+        if [[ "$status" == installed && "$package" =~ ^(libc6(-(amd64|i386|x32|sparc|mips32|mipsn32))?(:|$)|libssl[0-9]) ]]; then
             frozen+=("$package=$version")
         fi
     done < <(dpkg-query -W -f='${binary:Package}\t${Version}\t${db:Status-Status}\n' 'libc6*' 'libssl*' 2>/dev/null || true)
     plan="$TMPDIR_PRIVATE/apt-plan"
     if ! apt-get -s --no-remove install "$@" "${frozen[@]}" >"$plan" 2>&1; then
+        install -m 0600 "$plan" "$BACKUP/apt-plan.txt"
+        say "依赖诊断已保留：$BACKUP/apt-plan.txt（不含 SOCKS5 凭据）" >&2
         die '依赖预检查失败。未升级 libc6/libssl；请检查 apt 软件源/依赖（不运行全局修复）。'
     fi
-    if grep -Eq '^Inst (libc6(:|[[:space:]]|-)|libssl[0-9])' "$plan"; then
+    if grep -Eq '^Inst (libc6(-(amd64|i386|x32|sparc|mips32|mipsn32))?(:|[[:space:]])|libssl[0-9])' "$plan"; then
+        install -m 0600 "$plan" "$BACKUP/apt-plan.txt"
+        say '以下运行库变更被拦截（不是开发包）：' >&2
+        awk '/^Inst (libc6(-(amd64|i386|x32|sparc|mips32|mipsn32))?(:|[[:space:]])|libssl[0-9])/ {print $1, $2}' "$plan" >&2
+        say "完整依赖计划：$BACKUP/apt-plan.txt（不含 SOCKS5 凭据）" >&2
         die 'apt 计划更改 libc6/libssl 运行库，已中止。需要与现有运行库匹配的构建依赖，不能强行升级。'
     fi
     # List-only needrestart: do not automatically restart unrelated services.
@@ -136,9 +144,16 @@ apt_install_safe() {
 }
 
 prepare_repository() {
-    local file
+    local file retired
     # Only retire the old installer's dedicated repo files, not mixed/global lists.
     for file in "$REPO" /etc/apt/sources.list.d/3proxy.list; do
+        # Earlier installer versions left disabled backups in sources.list.d.
+        # Move those dedicated backups out to avoid apt's filename notices.
+        for retired in "$file".disabled.run.*; do
+            [[ -f "$retired" && ! -L "$retired" ]] || continue
+            grep -qE 'https?://3proxy\.org/repo/deb/?([[:space:]]|$)' "$retired" || continue
+            mv -- "$retired" "$BACKUP/$(basename "$retired")"
+        done
         [[ -e "$file" ]] || continue
         [[ -f "$file" && ! -L "$file" ]] || die "软件源不是普通文件：$file"
         grep -qE 'https?://3proxy\.org/repo/deb/?([[:space:]]|$)' "$file" ||
@@ -153,8 +168,7 @@ prepare_repository() {
             grep -Eq '^URIs:[[:space:]]+https://3proxy\.org/repo/deb/?[[:space:]]*$' "$file" ||
                 die "软件源混有其他地址：$file；未修改。"
         fi
-        cp -a -- "$file" "$BACKUP/$(basename "$file")"
-        mv -- "$file" "$file.disabled.$(basename "$BACKUP")"
+        mv -- "$file" "$BACKUP/$(basename "$file")"
     done
     # Detect duplicates instead of rewriting arbitrary administrator-owned files.
     if grep -El 'https?://3proxy\.org/repo/deb' /etc/apt/sources.list \
@@ -336,7 +350,8 @@ EOF
 self_test() {
     say '[4/4] 本机 SOCKS5 认证及 TCP 出口测试...'
     local test_ip
-    # Password is never in argv, the URL, stdout, journal or shell history.
+    # Test credentials are never passed in process argv or the URL, or logged.
+    # The final connection string is intentionally displayed on the terminal.
     # -q avoids ~/.curlrc; explicit noproxy prevents proxy bypass via environment.
     cat >"$TMPDIR_PRIVATE/curl.conf" <<EOF
 proxy = "socks5h://$TEST_HOST:$PROXY_PORT"
@@ -355,15 +370,21 @@ EOF
     else
         say '服务已监听，但外部 TCP 测试未通过；可能是 DNS/外网问题，需要进一步验证。'
     fi
-    unset PROXY_PASS
     ROLLBACK=0
     say ''
-    say "服务已启用：$PROXY_IP:$PROXY_PORT；账号：$PROXY_USER；密码为你刚才输入的值（不回显）。"
+    say "服务已启用：$PROXY_IP:$PROXY_PORT；账号：$PROXY_USER；完整连接信息见末尾 SK5 行。"
     say "配置：$CONFIG（root:root 0600）；备份：$BACKUP"
     say '状态：systemctl is-active 3proxy；监听：ss -lntp | grep 3proxy'
     say '未改动 x-ui/Xray、系统防火墙或云安全组。外部客户端请单独检查该 TCP 端口是否放行。'
     say 'SOCKS5 UDP 使用动态中继端口；本次 TCP 测试不等于 UDP 已通过。'
     [[ "$LISTEN_IP" != 0.0.0.0 ]] || say '当前公网 IP 不在本机网卡：已使用 NAT 模式。UDP 还需要一对一地址/端口映射；PAT 不能仅靠 -Ni 解决。'
+    # User explicitly requested the clear-text IP:port:user:password format.
+    # Write only to the controlling terminal, not redirected stdout/log files.
+    {
+        printf '\nSK5 格式（IP:端口:用户名:密码，可直接复制）：\n'
+        printf '%s:%s:%s:%s\n' "$PROXY_IP" "$PROXY_PORT" "$PROXY_USER" "$PROXY_PASS"
+    } >/dev/tty
+    unset PROXY_PASS
 }
 
 main() {
@@ -382,7 +403,7 @@ main() {
     trap 'say "安装中止（步骤出错）；不显示命令、配置或凭据。" >&2' ERR
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    say '=== 3proxy SOCKS5 Ubuntu 安装/配置 ==='
+    say "=== 3proxy SOCKS5 Ubuntu 安装/配置（$INSTALLER_REVISION） ==="
     detect_os
     # Existing drop-ins could override ExecStart/User/Environment, so do not guess.
     local drops
@@ -391,7 +412,7 @@ main() {
     [[ $(systemctl is-enabled 3proxy.service 2>/dev/null || true) != masked ]] ||
         die '3proxy 服务被 masked；请先核对，脚本不会自动解除屏蔽。'
     systemctl is-active --quiet 3proxy.service && OLD_ACTIVE=1
-    systemctl is-enabled --quiet 3proxy.service && OLD_ENABLED=1
+    systemctl is-enabled --quiet 3proxy.service >/dev/null 2>&1 && OLD_ENABLED=1
     OLD_PID=$(systemctl show -p MainPID --value 3proxy.service)
     OLD_PID=${OLD_PID:-0}
     if [[ -e "$CONFIG" || -e "$UNIT" ]] || (( OLD_ACTIVE )); then
