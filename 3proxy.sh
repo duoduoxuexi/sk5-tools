@@ -9,7 +9,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 unset PROXY_PASS PROXY_USER
 
 readonly SOURCE_VERSION=0.9.9.0
-readonly INSTALLER_REVISION=2026-09-30.3
+readonly INSTALLER_REVISION=2026-09-30.4
 readonly SOURCE_SHA256=5af253fa734f61af6d5fe3790022130a14caf25bfce24a6aefd415797d351dd3
 readonly CONFIG=/etc/3proxy/3proxy.cfg
 readonly UNIT=/etc/systemd/system/3proxy.service
@@ -217,6 +217,22 @@ snapshot() {
     done
 }
 
+install_source_dependencies() {
+    local arch libc_version
+    arch=$(dpkg --print-architecture)
+    libc_version=$(dpkg-query -W -f='${Version}' "libc6:$arch") ||
+        die '无法读取本机 libc6 版本，未安装依赖。'
+    [[ -n "$libc_version" ]] || die '本机 libc6 版本为空，未安装依赖。'
+    # focal's updated libc6-dev requires EXACTLY the matching libc6 revision.
+    # For old base images, select the dev packages matching the installed runtime,
+    # not apt's newest candidate. Do not install C++/dpkg-dev via build-essential:
+    # this source build only needs a C compiler, make and the native libc headers.
+    say "构建依赖使用本机 libc6 对应版本：$libc_version（运行库保持不变）。"
+    apt_install_safe --no-install-recommends gcc make \
+        "libc6-dev:$arch=$libc_version" "libc-dev-bin:$arch=$libc_version" \
+        ca-certificates curl iproute2
+}
+
 install_software() {
     say '[1/4] 准备专用软件源及依赖（不升级 libc6/libssl）...'
     # curl/iproute2 must already exist for input discovery and conflict checks.
@@ -230,7 +246,7 @@ install_software() {
     prepare_repository
     apt-get update
     if [[ "$MODE" == source ]]; then
-        apt_install_safe build-essential ca-certificates curl iproute2
+        install_source_dependencies
         say "[2/4] 编译官方固定版本 $SOURCE_VERSION（不启用 TLS/PAM/PCRE 插件）..."
         curl -q -fsSL --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 180 --retry 2 \
             "https://codeload.github.com/3proxy/3proxy/tar.gz/refs/tags/$SOURCE_VERSION" \
